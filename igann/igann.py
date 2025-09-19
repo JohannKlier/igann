@@ -406,6 +406,22 @@ class IGANN:
             self.scaler_dict_[col_name] = inverse_transform_fn
         # print(self.scaler_dict_)
 
+    def rescale_x(self, feature_name, values):
+        if (
+            # check if scaler_dict is already up
+            hasattr(self, "scaler_dict_")
+            # check if feature name is in numerical cols
+            and feature_name in getattr(self, "numerical_cols", [])
+            # check if feature is in scaler dict
+            and feature_name in self.scaler_dict_
+        ):
+            # get rescaler function
+            rescale_func = self.scaler_dict_[feature_name]
+            # ensure array-like for vectorization
+            values = np.vectorize(rescale_func)(np.asarray(values, dtype=float))
+
+        return values
+
     def scale_y(self, y, fit_transform=True):
         """
         This function scales the target variable y. It is used to ensure that the optimization
@@ -442,6 +458,20 @@ class IGANN:
         else:
             return y
 
+    def scale_y_per_feature(self, y):
+        """
+        This function scales the target variable y but does not subtract the mean.
+        """
+        # Convert y to a numpy array if it is a scalar, list, or any other type
+        if isinstance(y, (float, int)):
+            y = np.array([y])
+        else:
+            y = np.array(y)
+        if self.task == "regression" and self.scale_target:
+            # rescale y
+            y = self.y_scaler_per_feature.transform(y.reshape(-1, 1)).flatten()
+        return y
+
     def rescale_y(self, y):
         """
         This function rescales the target variable y back to the original scale.
@@ -463,7 +493,7 @@ class IGANN:
 
     def rescale_y_per_feature(self, y):
         """
-        This function rescales the target variable y back to the original scale without subtracting the mean.
+        This function rescales the target variable y back to the original scale without adding tracting the mean.
         """
 
         # Convert y to a numpy array if it is a scalar, list, or any other type
@@ -474,7 +504,7 @@ class IGANN:
         if self.task == "regression" and self.scale_target:
             # rescale y
             y = self.y_scaler_per_feature.inverse_transform(y.reshape(-1, 1)).flatten()
-            return y
+        return y
 
     def fit(self, X, y, val_set=None):
         """
@@ -952,6 +982,7 @@ class IGANN:
                 )
                 final_shape_functions[name]["hist"]["classes"].append(class_name)
 
+        # print(final_shape_functions)
         return final_shape_functions
 
     def plot_single(
@@ -1013,46 +1044,9 @@ class IGANN:
         # Force axs to be 2D if it is not already
         axs = axs.reshape(total_rows, total_cols)
 
-        def _inverse_transform_x_if_needed(shape_func, scaler_dict):
-            """
-            Inversely transform the shape function's x and y values and histogram edges
-            if:
-            1) shape_func is numeric, AND
-            2) shape_func['name'] is in scaler_dict
-            """
-            # If no scaler_dict is provided, just return as-is
-            if scaler_dict is None:
-                return shape_func
-
-            # if y is in scaler_dict, inverse-transform
-            if "y" in scaler_dict:
-                scaler_func = scaler_dict["y"]
-                shape_func["y"] = np.array(
-                    scale_func(np.array(shape_func["y"]).reshape(-1, 1))
-                )
-
-            # Check if in scaler_dict
-            if shape_func["name"] in scaler_dict:
-                scaler_func = scaler_dict[shape_func["name"]]
-
-                # Inverse-transform x-values
-                x_arr = np.array(shape_func["x"]).reshape(-1, 1)
-                x_inv = scaler_func(x_arr)
-                shape_func["x"] = np.array(x_inv).ravel()
-
-                # Inverse-transform histogram edges
-                edges_arr = np.array(shape_func["hist"]["edges"]).reshape(-1, 1)
-                edges_inv = scaler_func(edges_arr)
-                shape_func["hist"]["edges"] = np.array(edges_inv).ravel()
-
-            return shape_func
-
         # helper function to plot numerical shape
         def _plot_numeric(ax_top, ax_bottom, shape_function):
-            shape_function = _inverse_transform_x_if_needed(shape_function, scaler_dict)
-            # print(shape_function["x"])
-            # print(shape_function["y"])
-            # print(shape_function["hist"]["edges"])
+
             sns.lineplot(
                 x=shape_function["x"],
                 y=shape_function["y"],
@@ -1071,7 +1065,6 @@ class IGANN:
 
         # helper function to plot categorical shape
         def _plot_categorical(ax_top, ax_bottom, shape_function):
-            shape_function = _inverse_transform_x_if_needed(shape_function, scaler_dict)
             ax_top.bar(
                 x=shape_function["x"],
                 height=shape_function["y"],
