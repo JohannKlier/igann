@@ -29,18 +29,14 @@ class IGANN_interactive(IGANN):
     Extends IGANN to use shape functions directly for predictions during both training
     and inference, enabling customizable and interpretable decision logic.
 
-    Features:
-    - **Shape Function Predictions:** Simplifies predictions by relying on shape functions
+    Ideas:
+    -Shape Function Predictions: Simplifies predictions by relying on shape functions
         instead of the ensemble, reducing complexity and accelerating inference.
-    - **Interactive Customization:** Facilitates real-time adaptation of decision logic
-        through modifiable shape functions.
-    - **Training Flexibility:** Supports using shape functions during training, with a potenial benefit of decrasing
+    -Interactive Customization: Facilitates real-time adaptation of decision logic
+        through modifiable shape functions in json format.
+    -Training Flexibility: Supports using shape functions during training, with a potenial benefit of decrasing
         memory usage for enhanced interpretability.
-    - **IGANN Compatibility:** Closely mimics IGANN's behavior, allowing seamless integration.
-
-    Benefits:
-    - Faster predictions and reduced computational complexity.
-    - Enhanced control and interpretability of decision logic.
+    -IGANN Compatibility:Closely mimics IGANN's behavior, allowing seamless integration.
 
     Note: This class is experimental and may not be well maintained.
     """
@@ -169,7 +165,6 @@ class IGANN_interactive(IGANN):
         # if we use the GAMwrapper, we compress the ELMs to a GAM model in the end of the optimization
         if self.GAMwrapper == True:
             self.compress_to_GAM()
-        return best_loss
 
         return best_loss
 
@@ -218,6 +213,7 @@ class IGANN_interactive(IGANN):
 
     def _get_pred_of_i(self, i, x_values=None):
         # print("get_pred_of_i of igann_interactive")
+        # print(self.feature_names)
         feat_name = self.feature_names[i]
         if x_values == None:
             feat_values = self.unique[i]
@@ -227,8 +223,13 @@ class IGANN_interactive(IGANN):
         #### Start - addtional code for IGANN_interactive #####
         # if there is a GAMwarapper and its feature dict is set up we use this for a prediction
         if self.GAMwrapper and self.GAM and self.GAM.feature_dict:
-            raw_feat_values = self.scaler_dict_[feat_name](feat_values.cpu().numpy())
-            # print("using predict_single of GAM")
+            # print(self.scaler_dict_.keys())
+            # print("feat_values before")
+            # print(feat_values)
+            if feat_name in self.scaler_dict_.keys():
+                raw_feat_values = self.rescale_x(feat_name, feat_values)
+            else:
+                raw_feat_values = feat_values
             pred = self.GAM.predict_single(i, raw_feat_values)
             pred = torch.from_numpy(np.array(pred))
         #### End - addtional code for IGANN_interactive #####
@@ -238,6 +239,7 @@ class IGANN_interactive(IGANN):
                 pred = self.linear_model.coef_[0, i] * feat_values
             else:
                 pred = self.linear_model.coef_[i] * feat_values
+        # print(pred)
 
         feat_values = feat_values.to(self.device)
         # print(f"Regressors: {len(self.regressors)}")
@@ -325,7 +327,7 @@ class GAMmodel:
         # TODO: Check if we can use the Base IGANN Shapefunction without manipulating it.
         shape_data = self.base_model.get_shape_functions_as_dict()
         for feature, feature_dict in shape_data.items():
-
+            # print(feature_dict["y"])
             feature_name = feature_dict["name"]
             feature_type = feature_dict["datatype"]
             feature_x = feature_dict["x"]
@@ -413,7 +415,8 @@ class GAMmodel:
                 x, x_values, y_values
             )  # Linear interpolation # also strategies for interpolation beyond x limtis can be created here.
         # print(len(y))
-        return y
+        y_scaled = self.base_model.scale_y_per_feature(y)
+        return y_scaled
 
     def predict_raw(
         self,
@@ -430,14 +433,14 @@ class GAMmodel:
         # print(y)
 
         y = np.array(y.sum(axis=1))
-        if self.base_model.task == "regression" and self.base_model.scale_target:
-            y = y + self.base_model.y_scaler.mean_
+        # if self.base_model.task == "regression" and self.base_model.scale_target:
+        #     y = y + self.base_model.y_scaler.mean_
 
-        y_scaled = self.base_model.scale_y(y, fit_transform=False)
+        # y_scaled = self.base_model.scale_y(y, fit_transform=False)
 
         # print(y_scaled)
         # print(self.base_model.linear_model.intercept_)
-        y_predict_raw = y_scaled + self.base_model.linear_model.intercept_
+        y_predict_raw = y + self.base_model.linear_model.intercept_
 
         return y_predict_raw
 
