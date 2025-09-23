@@ -163,7 +163,7 @@ class feature_handler:
 def create_igann_interactive_app(igann_interactive_model, init_port=8051):
     """
     Creates and returns a Dash app that wraps the IGANN_interactive model.
-    You can then run app.run_server(...) wherever you want.
+    You can then run app.run(...) wherever you want.
     or even better use the run_igann_interactive function
     """
 
@@ -578,4 +578,4 @@ def run_igann_interactive(igann_interactive_model, port=8051):
     Create and immediately run the Dash server on the given port.
     """
     app = create_igann_interactive_app(igann_interactive_model, init_port=port)
-    app.run_server(debug=True, use_reloader=False, port=port)
+    app.run(debug=True, use_reloader=False, port=port)
