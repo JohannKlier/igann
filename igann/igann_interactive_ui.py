@@ -20,6 +20,9 @@ from datetime import datetime
 import i2dgraph
 from i2dgraph import interactive_graph
 
+# new callback trigger from dash >= 2.4
+from dash import ctx
+
 
 ##############################################################################
 # Helper functions: converting types, saving/loading, etc.
@@ -163,8 +166,6 @@ class feature_handler:
 def create_igann_interactive_app(igann_interactive_model, init_port=8051):
     """
     Creates and returns a Dash app that wraps the IGANN_interactive model.
-    You can then run app.run(...) wherever you want.
-    or even better use the run_igann_interactive function
     """
 
     # --------------------------------------------
@@ -191,8 +192,7 @@ def create_igann_interactive_app(igann_interactive_model, init_port=8051):
         additionalDataColor=["orange"],
     ):
         """
-        Example for i2dgraph.
-        If you're not using i2dgraph, replace with your standard dcc.Graph, etc.
+        Example with i2dgraph.
         """
         from i2dgraph import interactive_graph
 
@@ -338,14 +338,14 @@ def create_igann_interactive_app(igann_interactive_model, init_port=8051):
                 id={"type": "move-button", "index": feature_name},
                 color="primary",
                 size="sm",
-                className="ml-auto",
+                className="ms-auto",
             )
             reset_button = dbc.Button(
                 "Reset",
                 id={"type": "reset-button", "index": feature_name},
                 color="danger",
                 size="sm",
-                className="ml-auto",
+                className="ms-auto",
             )
 
             # Build the card header
@@ -356,11 +356,11 @@ def create_igann_interactive_app(igann_interactive_model, init_port=8051):
             # "Move to Top" doesn't apply for the first item
             if i != 0:
                 header_cols.append(
-                    dbc.Col(move_button, width="auto", className="ml-auto")
+                    dbc.Col(move_button, width="auto", className="ms-auto")
                 )
 
             # Reset always relevant
-            header_cols.append(dbc.Col(reset_button, width="auto", className="ml-auto"))
+            header_cols.append(dbc.Col(reset_button, width="auto", className="ms-auto"))
 
             card_header = dbc.CardHeader(
                 dbc.Row(
@@ -376,6 +376,7 @@ def create_igann_interactive_app(igann_interactive_model, init_port=8051):
                     dbc.CardBody(
                         html.Div(
                             graph_component,
+                            key=f"{feature_name}-body",
                             style={
                                 "width": "100%",
                                 "height": "100%",
@@ -384,6 +385,7 @@ def create_igann_interactive_app(igann_interactive_model, init_port=8051):
                         )
                     ),
                 ],
+                key=f"{feature_name}-card",
                 className="h-100",
                 style={"width": "100%"},
             )
@@ -391,6 +393,7 @@ def create_igann_interactive_app(igann_interactive_model, init_port=8051):
             columns.append(
                 dbc.Col(
                     graph_card,
+                    key=feature_name,
                     xs=sizes["xs"],
                     sm=sizes["sm"],
                     md=sizes["md"],
@@ -467,7 +470,7 @@ def create_igann_interactive_app(igann_interactive_model, init_port=8051):
         Output("feature-dropdown", "value"),
         Input(
             {"type": "move-button", "index": dash.dependencies.ALL},
-            "n_clicks_timestamp",
+            "n_clicks",
         ),
         State({"type": "move-button", "index": dash.dependencies.ALL}, "id"),
         State("feature-dropdown", "value"),
@@ -477,17 +480,26 @@ def create_igann_interactive_app(igann_interactive_model, init_port=8051):
         if not selected_features:
             raise PreventUpdate
 
-        max_ts = max(ts or 0 for ts in all_timestamps)
-        if max_ts == 0:
+        # check for new button here
+        trig_list = getattr(callback_context, "triggered", [])
+        if not trig_list:
+            raise PreventUpdate
+        clicked_value = trig_list[0].get("value", 0)
+        try:
+            clicked_value = int(clicked_value)
+        except (TypeError, ValueError):
+            clicked_value = 0
+        if clicked_value <= 0:
             raise PreventUpdate
 
-        changed_idx = all_timestamps.index(max_ts)
-        feature_to_move = all_ids[changed_idx]["index"]
-
+        trig = getattr(callback_context, "triggered_id", None)
+        feature_to_move = trig.get("index") if isinstance(trig, dict) else trig
+        # print(feature_to_move)
         if feature_to_move in selected_features:
             updated_features = [feature_to_move] + [
                 f for f in selected_features if f != feature_to_move
             ]
+            # print(updated_features)
             return updated_features
         else:
             raise PreventUpdate
@@ -499,7 +511,7 @@ def create_igann_interactive_app(igann_interactive_model, init_port=8051):
         Output("graph-state-store", "data"),
         Input(
             {"type": "reset-button", "index": dash.dependencies.ALL},
-            "n_clicks_timestamp",
+            "n_clicks",
         ),
         State({"type": "reset-button", "index": dash.dependencies.ALL}, "id"),
         State("feature-dropdown", "value"),
@@ -510,15 +522,17 @@ def create_igann_interactive_app(igann_interactive_model, init_port=8051):
         if not selected_features:
             raise PreventUpdate
 
-        max_ts = max(ts or 0 for ts in all_timestamps)
-        if max_ts == 0:
+        trig = getattr(callback_context, "triggered_id", None)
+
+        # Pattern-matching IDs return a dict; extract the feature name
+        feature_name = trig.get("index") if isinstance(trig, dict) else trig
+        if not feature_name:
             raise PreventUpdate
 
-        changed_idx = all_timestamps.index(max_ts)
-        feature_name = all_ids[changed_idx]["index"]
-
+        # Reset the feature in your model
         fh.reset_feature(feature_name)
 
+        # Optionally note the reset time in the store to trigger dependent callbacks
         if graph_state is None:
             graph_state = {}
         graph_state[feature_name] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

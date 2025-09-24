@@ -4,6 +4,9 @@
 # pip install git+https://github.com/MathiasKraus/igann.git@GAM_wrapper
 # install i2dgraph with:
 # pip install i2dgraph
+# install dash and dash bootstrap with:
+# pip install dash
+# pip install dash-bootstrap-components
 
 
 # %%
