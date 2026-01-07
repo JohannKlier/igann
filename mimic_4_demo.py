@@ -157,8 +157,8 @@ from igann import IGANN_interactive
 igann_i = IGANN_interactive(
     task="classification",
     n_estimators=1000,
-    regressor_limit=1000,  # set this to n_estimator otherwise wired things can happen
-    verbose=0,  # 1,
+    regressor_limit=10,  # set this to n_estimator otherwise wired things can happen
+    verbose=1,  # 1,
     GAM_detail=100,  # number of points used to save and represent the shapefunction
 )
 igann_i.fit(X_train_reduced, y_train_reduced)
