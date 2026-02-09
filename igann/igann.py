@@ -444,7 +444,7 @@ class IGANN:
                 y_scaled = self.y_scaler.fit_transform(y.reshape(-1, 1)).flatten()
                 # set up the per feature scaler
                 self.y_scaler_per_feature = StandardScaler()
-                self.y_scaler_per_feature.mean_ = 0  # we don't subtract the mean
+                self.y_scaler_per_feature.mean_ =  np.zeros_like(self.y_scaler.scale_)
                 self.y_scaler_per_feature.scale_ = (
                     self.y_scaler.scale_
                 )  # we use the same scale
