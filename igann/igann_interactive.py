@@ -66,6 +66,9 @@ class IGANN_interactive(IGANN):
         counter_no_progress = 0
         best_iter = 0
 
+        # Build optional hidden-feature mask for freezing selected feature functions.
+        hidden_feature_mask = self._build_hidden_feature_mask()
+
         # Sequentially fit one ELM after the other. Max number is stored in self.n_estimators.
         for counter in range(self.n_estimators):
             #### Start - addtional code for IGANN_interactive #####
@@ -98,13 +101,15 @@ class IGANN_interactive(IGANN):
             )
 
             # Fit ELM regressor
-            X_hid = regressor.fit(
-                X,
-                y_tilde,
+            mult_coef = (
                 torch.sqrt(torch.tensor(0.5).to(self.device))
                 * self.boost_rate
-                * hessian_train_sqrt[:, None],
+                * hessian_train_sqrt[:, None]
             )
+            if hidden_feature_mask is not None:
+                mult_coef = mult_coef * hidden_feature_mask.unsqueeze(0)
+
+            X_hid = regressor.fit(X, y_tilde, mult_coef)
 
             # Make a prediction of the ELM for the update of y_hat
             train_regressor_pred = regressor.predict(X_hid, hidden=True).squeeze()
@@ -167,6 +172,40 @@ class IGANN_interactive(IGANN):
             self.compress_to_GAM()
 
         return best_loss
+
+    def _build_hidden_feature_mask(self):
+        """
+        Build a mask over hidden-space columns to freeze selected feature functions during boosting.
+        Set ``self.locked_feature_names`` to a list/set of feature names to freeze.
+        For categorical features, pass the original categorical feature name.
+        """
+        locked = getattr(self, "locked_feature_names", None)
+        if not locked:
+            return None
+
+        locked_set = {str(name) for name in locked}
+        hidden_dim = self.n_numerical_cols * self.n_hid + self.n_categorical_cols
+        mask = torch.ones(hidden_dim, dtype=torch.float32, device=self.device)
+
+        for i, feat_name in enumerate(self.feature_names):
+            is_numerical = i < self.n_numerical_cols
+            base_name = feat_name if is_numerical else feat_name.rsplit("_", 1)[0]
+            is_locked = feat_name in locked_set or base_name in locked_set
+            if not is_locked:
+                continue
+
+            if is_numerical:
+                start = i * self.n_hid
+                mask[start : start + self.n_hid] = 0.0
+            else:
+                idx = self.n_numerical_cols * self.n_hid + (i - self.n_numerical_cols)
+                mask[idx] = 0.0
+
+        if torch.sum(mask).item() == 0:
+            warnings.warn(
+                "All features are locked for boosting. No additional regressors can be learned."
+            )
+        return mask
 
     def predict_raw(self, X):
         """
@@ -286,6 +325,125 @@ class IGANN_interactive(IGANN):
         # for
         # for featue in y.Columns():
 
+    def center_shape_functions(self, X=None, update_intercept=True):
+        """
+        Enforce an empirical centering constraint E[f_j(X_j)] = 0 for all feature
+        shape functions in the GAM representation.
+
+        This is optional and not called automatically.
+        """
+        if self.GAM is None:
+            self.compress_to_GAM()
+
+        if X is None:
+            if hasattr(self, "raw_X_train"):
+                X = self.raw_X_train
+            elif hasattr(self, "raw_X"):
+                X = self.raw_X
+            else:
+                raise RuntimeError(
+                    "No reference data available. Provide X explicitly."
+                )
+
+        return self.GAM.center_feature_dict(X, update_intercept=update_intercept)
+
+    def continue_fit(self, X, y, val_set=None):
+        """
+        Continue optimization from the model's current state (including edited GAM shape functions).
+
+        Unlike ``fit``, this does not reset the model, does not refit preprocessing,
+        and does not refit the linear model. It only adds additional ELM regressors
+        on top of the current prediction function.
+        """
+        if not hasattr(self, "column_transformer") or not hasattr(self, "linear_model"):
+            raise RuntimeError(
+                "Model is not initialized. Call fit(...) once before continue_fit(...)."
+            )
+
+        # Keep raw copies (used inside optimization when GAM compression is active).
+        self.raw_X = X.copy()
+
+        indices = np.arange(len(X))
+        train_indices, val_indices = train_test_split(
+            indices,
+            test_size=0.15,
+            stratify=y if self.task == "classification" else None,
+            random_state=self.random_state,
+        )
+
+        self.raw_X_train = X.iloc[train_indices]
+        self.raw_X_val = X.iloc[val_indices]
+        if type(y) == pd.Series or type(y) == pd.DataFrame:
+            self.raw_y_train = y.iloc[train_indices]
+            self.raw_y_val = y.iloc[val_indices]
+
+        # Reuse fitted preprocessing/scalers from the initial fit.
+        X_proc = self._preprocess_feature_matrix(X, fit_transform=False)
+        y_scaled = self.scale_y(y, fit_transform=False)
+        if type(y_scaled) == pd.Series or type(y_scaled) == pd.DataFrame:
+            y_scaled = y_scaled.values
+        y_torch = torch.from_numpy(np.asarray(y_scaled).squeeze()).float()
+
+        if self.task == "classification" and torch.min(y_torch) != -1:
+            y_torch = 2 * y_torch - 1
+
+        if val_set is None:
+            X_train = X_proc[train_indices]
+            X_val = X_proc[val_indices]
+            y_train = y_torch[train_indices]
+            y_val = y_torch[val_indices]
+        else:
+            X_train = X_proc
+            y_train = y_torch
+
+            X_val_raw, y_val_raw = val_set
+            self.raw_X_val = X_val_raw
+            X_val = self._preprocess_feature_matrix(X_val_raw, fit_transform=False)
+            y_val_scaled = self.scale_y(y_val_raw, fit_transform=False)
+            if type(y_val_scaled) == pd.Series or type(y_val_scaled) == pd.DataFrame:
+                y_val_scaled = y_val_scaled.values
+            y_val = torch.from_numpy(np.asarray(y_val_scaled).squeeze()).float()
+            if self.task == "classification" and torch.min(y_val) != -1:
+                y_val = 2 * y_val - 1
+
+        # Warm-start from current model prediction (GAM + existing regressors if present).
+        y_hat_train = torch.tensor(
+            self.predict_raw(self.raw_X_train), dtype=torch.float32
+        )
+        y_hat_val = torch.tensor(self.predict_raw(self.raw_X_val), dtype=torch.float32)
+
+        if not hasattr(self, "criterion"):
+            if self.task == "classification":
+                self.criterion = lambda prediction, target: torch.nn.BCEWithLogitsLoss()(
+                    prediction, torch.nn.ReLU()(target)
+                )
+            elif self.task == "regression":
+                self.criterion = torch.nn.MSELoss()
+            else:
+                raise ValueError("Task not implemented. Can be classification or regression")
+
+        best_loss = self.criterion(y_hat_val, y_val)
+
+        X_train, y_train, y_hat_train, X_val, y_val, y_hat_val = (
+            X_train.to(self.device),
+            y_train.to(self.device),
+            y_hat_train.to(self.device),
+            X_val.to(self.device),
+            y_val.to(self.device),
+            y_hat_val.to(self.device),
+        )
+
+        self._run_optimization(
+            X_train,
+            y_train,
+            y_hat_train,
+            X_val,
+            y_val,
+            y_hat_val,
+            best_loss,
+        )
+        return self
+
     #### End - addtional code for IGANN_interactive #####
 
 
@@ -346,6 +504,43 @@ class GAMmodel:
                 "x": feature_x_new,
                 "y": feature_y_new,
             }
+
+    def center_feature_dict(self, X, update_intercept=True):
+        """
+        Center each feature contribution around zero on reference data X by
+        subtracting the empirical mean contribution from the feature's shape.
+        Optionally add the removed mass back to the model intercept to preserve
+        overall predictions.
+        """
+        if not self.feature_dict:
+            raise RuntimeError("feature_dict is empty. Call set_shape_functions() first.")
+
+        feature_means = {}
+        intercept_shift = 0.0
+
+        for feature_name, feature in self.feature_dict.items():
+            if feature_name not in X.columns:
+                continue
+
+            contrib = np.asarray(self.predict_single(feature_name, X[feature_name]))
+            mu = float(np.mean(contrib)) if contrib.size else 0.0
+            feature_means[feature_name] = mu
+
+            y_vals = np.asarray(feature.get("y", []), dtype=float)
+            if y_vals.size == 0:
+                continue
+            feature["y"] = (y_vals - mu).tolist()
+            intercept_shift += mu
+
+        if update_intercept:
+            self.base_model.linear_model.intercept_ = (
+                self.base_model.linear_model.intercept_ + intercept_shift
+            )
+
+        return {
+            "feature_means": feature_means,
+            "intercept_shift": intercept_shift,
+        }
 
     def create_points(self, X, Y, num_points):
         """
