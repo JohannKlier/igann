@@ -24,14 +24,6 @@ from sklearn.metrics import (
 )
 
 
-class _LinearInitModel:
-    """Minimal linear container for GAM-initialized refits."""
-
-    def __init__(self, coef, intercept):
-        self.coef_ = coef
-        self.intercept_ = intercept
-
-
 class IGANN_interactive(IGANN):
     """
     Extends IGANN to use shape functions directly for predictions during both training
@@ -50,11 +42,14 @@ class IGANN_interactive(IGANN):
     """
 
     def __init__(
-        self, *args, GAMwrapper=True, GAM_detail=100, regressor_limit=100, **kwargs
+        self,
+        *args,
+        GAM_detail=100,
+        regressor_limit=100,
+        GAMwrapper=None,
+        **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.GAMwrapper = GAMwrapper
-        self.GAM = None
         self.GAM_detail = GAM_detail
         self.regressor_limit = regressor_limit
         self._compress_after_optimization = True
@@ -62,6 +57,7 @@ class IGANN_interactive(IGANN):
         self._saved_train_indices = None
         self._saved_val_indices = None
         self._saved_split_index_values = None
+        self.GAM = GAMmodel(task=self.task, detail=self.GAM_detail)
 
     def _get_or_create_split_indices(self, X, y_arr):
         """Reuse a saved train/val split for stable iterative refits when possible."""
@@ -88,6 +84,12 @@ class IGANN_interactive(IGANN):
         self._saved_split_index_values = current_index_values.copy()
         return train_indices, val_indices
 
+    def fit(self, X, y, val_set=None):
+        super().fit(X, y, val_set=val_set)
+        if self.GAM is None or not self.GAM.feature_dict:
+            self.compress_to_GAM()
+        return self
+
     def _run_optimization(self, X, y, y_hat, X_val, y_val, y_hat_val, best_loss):
         """
         This function runs the optimization for ELMs with single features. This function should not be called from outside.
@@ -109,14 +111,13 @@ class IGANN_interactive(IGANN):
             #### Start - addtional code for IGANN_interactive #####
             if self._compress_after_optimization and len(self.regressors) > self.regressor_limit:
                 print("Reached regressor limit compressing GAM")
-                if self.GAMwrapper == True:
-                    self.compress_to_GAM()
-                    y_hat = torch.tensor(
-                        self.predict_raw(self.raw_X_train), dtype=torch.float32
-                    )
-                    y_hat_val = torch.tensor(
-                        self.predict_raw(self.raw_X_val), dtype=torch.float32
-                    )
+                self.compress_to_GAM()
+                y_hat = torch.tensor(
+                    self.predict_raw(self.raw_X_train), dtype=torch.float32
+                )
+                y_hat_val = torch.tensor(
+                    self.predict_raw(self.raw_X_val), dtype=torch.float32
+                )
             #### End - addtional code for IGANN_interactive #####
             hessian_train_sqrt = self._loss_sqrt_hessian(y, y_hat)
             y_tilde = torch.sqrt(torch.tensor(0.5).to(self.device)) * self._get_y_tilde(
@@ -200,8 +201,8 @@ class IGANN_interactive(IGANN):
             self.regressors = self.regressors[:best_iter]
             self.boosting_rates = self.boosting_rates[:best_iter]
 
-        # if we use the GAMwrapper, we compress the ELMs to a GAM model in the end of the optimization
-        if self.GAMwrapper == True and self._compress_after_optimization:
+        # Compress the ELMs to the GAM base model at the end of optimization.
+        if self._compress_after_optimization:
             self.compress_to_GAM()
 
         return best_loss
@@ -212,18 +213,17 @@ class IGANN_interactive(IGANN):
         Note: for a classification task, it returns the raw logit values.
         """
         #### Start - addtional code for IGANN_interactive #####
-        # if we have a GAM wrapper, we use the GAM model for prediction
-        if self.GAMwrapper == True and self.GAM is not None:
+        # If GAM shape functions are available, use them as the base predictor.
+        if self.GAM is not None and self.GAM.feature_dict:
             # As the GAM uses shape function that are not scaled or one-hot encoded we will >>not<< preprocess the data.
             pred_shape = self.GAM.predict_raw(X)
-            # pred_shape = pred_ + (self.linear_model.intercept_)
         else:
-            # if we do not have a GAM wrapper we use the linear shape function for init prediction
+            # Fallback before GAM state exists during initial fit.
             pred_shape = (
                 self.linear_model.coef_.astype(np.float32) @ X.transpose()
             ).squeeze()
         # GAM.predict_raw already includes intercept; only add it in non-GAM branch.
-        if not (self.GAMwrapper == True and self.GAM is not None):
+        if not (self.GAM is not None and self.GAM.feature_dict):
             pred_shape += self.linear_model.intercept_
 
         # if we have regressors we use them to further imporve the prediction
@@ -267,16 +267,12 @@ class IGANN_interactive(IGANN):
             feat_values = x_values[i]
 
         #### Start - addtional code for IGANN_interactive #####
-        # if there is a GAMwarapper and its feature dict is set up we use this for a prediction
-        if self.GAMwrapper and self.GAM and self.GAM.feature_dict:
-            # print(self.scaler_dict_.keys())
-            # print("feat_values before")
-            # print(feat_values)
-            if hasattr(self, "scaler_dict_") and feat_name in self.scaler_dict_.keys():
-                raw_feat_values = self.rescale_x(feat_name, feat_values)
-            else:
-                raw_feat_values = feat_values
-            pred = self.GAM.predict_single(i, raw_feat_values)
+        # If GAM shape functions are available, use them for partial predictions.
+        if self.GAM and self.GAM.feature_dict:
+            gam_feature_name, raw_feat_values = self._resolve_gam_feature_input(
+                feat_name, feat_values
+            )
+            pred = self.GAM.predict_single(gam_feature_name, raw_feat_values)
             pred = torch.from_numpy(np.array(pred))
         #### End - addtional code for IGANN_interactive #####
 
@@ -344,37 +340,15 @@ class IGANN_interactive(IGANN):
             if torch.min(y_torch) != -1:
                 self.target_remapped_flag = True
                 y_torch = 2 * y_torch - 1
-            coef_shape = (1, len(self.feature_names))
         elif self.task == "regression":
             self.criterion = torch.nn.MSELoss()
-            coef_shape = len(self.feature_names)
         else:
             raise ValueError("Task not implemented. Can be classification or regression")
 
-        # Install edited GAM as base model and use zero linear weights.
-        self.linear_model = _LinearInitModel(
-            coef=np.zeros(coef_shape, dtype=np.float32),
-            intercept=0.0,
-        )
-        self.GAM = GAMmodel(self, self.task, self.GAM_detail)
-        self.GAM.set_feature_dict(deepcopy(feature_dict))
-
-        # Calibrate intercept from current GAM baseline.
-        base_pred = np.asarray(self.GAM.predict_raw(X)).reshape(-1)
-        if self.task == "classification":
-            target_mean = float(np.mean((y_arr >= 0.5).astype(float)))
-            target_mean = min(max(target_mean, 1e-4), 1 - 1e-4)
-            low, high = -12.0, 12.0
-            for _ in range(40):
-                mid = (low + high) / 2
-                probs = 1 / (1 + np.exp(-(base_pred + mid)))
-                if float(np.mean(probs)) < target_mean:
-                    low = mid
-                else:
-                    high = mid
-            self.linear_model.intercept_ = (low + high) / 2
-        else:
-            self.linear_model.intercept_ = float(np.mean(y_arr - base_pred))
+        if self.GAM is None:
+            self.GAM = GAMmodel(task=self.task, detail=self.GAM_detail)
+        self.GAM.set_feature_dict(self._normalize_feature_dict_for_gam(feature_dict))
+        self.GAM.calibrate_intercept(X, y_arr)
 
         X_train = X_proc[train_indices]
         X_val = X_proc[val_indices]
@@ -418,8 +392,11 @@ class IGANN_interactive(IGANN):
         """
         print("Compressing to GAM")
         if self.GAM is None:
-            self.GAM = GAMmodel(self, self.task, self.GAM_detail)
-        self.GAM.set_shape_functions()
+            self.GAM = GAMmodel(task=self.task, detail=self.GAM_detail)
+        self.GAM.set_shape_data(
+            self._normalize_feature_dict_for_gam(self.get_shape_functions_as_dict()),
+            intercept=self._get_linear_intercept(),
+        )
 
         # ass we now use the shape function for the prediction we do not need the regressors or bossting rates.
         self.regressors = []
@@ -463,7 +440,84 @@ class IGANN_interactive(IGANN):
             else:
                 raise RuntimeError("No reference data available. Provide X explicitly.")
 
-        return self.GAM.center_feature_dict(X, update_intercept=update_intercept)
+        if self.GAM is None or not self.GAM.feature_dict:
+            raise RuntimeError("No GAM shape functions available.")
+
+        feature_means = {}
+        intercept_shift_scaled = 0.0
+
+        for feature_name, feature in self.GAM.feature_dict.items():
+            if feature_name not in X.columns:
+                continue
+
+            contrib_scaled = np.asarray(
+                self.GAM.predict_single(feature_name, X[feature_name]),
+                dtype=float,
+            )
+            mu_scaled = float(np.mean(contrib_scaled)) if contrib_scaled.size else 0.0
+            feature_means[feature_name] = mu_scaled
+
+            y_vals = np.asarray(feature.get("y", []), dtype=float)
+            if y_vals.size == 0:
+                continue
+
+            feature["y"] = (y_vals - mu_scaled).tolist()
+            intercept_shift_scaled += mu_scaled
+
+        if update_intercept:
+            self.GAM.intercept_ += intercept_shift_scaled
+
+        return {
+            "feature_means": feature_means,
+            "intercept_shift": intercept_shift_scaled,
+        }
+
+    def _get_linear_intercept(self):
+        if not hasattr(self, "linear_model"):
+            return 0.0
+        return float(np.asarray(self.linear_model.intercept_).reshape(-1)[0])
+
+    def _get_raw_feature_values_for_gam(self, feature_name, feat_values):
+        if hasattr(self, "scaler_dict_") and feature_name in self.scaler_dict_:
+            return self.rescale_x(feature_name, feat_values)
+        return feat_values
+
+    def _resolve_gam_feature_input(self, feature_name, feat_values):
+        if feature_name in self.GAM.feature_dict:
+            return feature_name, self._get_raw_feature_values_for_gam(
+                feature_name, feat_values
+            )
+
+        if "_" in feature_name:
+            base_feature_name, class_name = feature_name.rsplit("_", 1)
+            if (
+                base_feature_name in self.GAM.feature_dict
+                and hasattr(self, "dropped_features")
+                and base_feature_name in self.dropped_features
+            ):
+                raw_values = [
+                    class_name if value == 1 else self.dropped_features[base_feature_name]
+                    for value in feat_values
+                ]
+                return base_feature_name, raw_values
+
+        raise KeyError(f"Unknown GAM feature: {feature_name}")
+
+    def _normalize_feature_dict_for_gam(self, feature_dict):
+        normalized = deepcopy(feature_dict)
+        for feature in normalized.values():
+            y_values = np.asarray(feature.get("y", []), dtype=float)
+            feature["y"] = self.scale_y_per_feature(y_values).tolist()
+        return normalized
+
+    def get_gam_feature_dict(self, scaled=False):
+        feature_dict = deepcopy(self.GAM.get_feature_dict())
+        if scaled:
+            return feature_dict
+        for feature in feature_dict.values():
+            y_values = np.asarray(feature.get("y", []), dtype=float)
+            feature["y"] = self.rescale_y_per_feature(y_values).tolist()
+        return feature_dict
 
     #### End - addtional code for IGANN_interactive #####
 
@@ -473,18 +527,11 @@ class GAMmodel:
     This is a wrapper class for the GAM model it handels the alternative functions that are based on the shapefunctions.
     """
 
-    def __init__(
-        self,
-        model,
-        task,
-        detail=100,
-    ):
-        self.base_model = model
+    def __init__(self, task, detail=100):
         self.task = task
-        self.GAM = None
         self.feature_dict = {}
         self.detail = detail
-        # print(self.base_model.feature_names)
+        self.intercept_ = 0.0
 
     def get_feature_dict(self):
         return self.feature_dict
@@ -493,26 +540,13 @@ class GAMmodel:
         self.feature_dict = feat_dict
         return
 
-    def update_feature_dict(self, feat_dict):
-        self.feature_dict.update(feat_dict)
-        return
-
-    def set_shape_functions(self):
-        """
-        This function creates the shape functions for the GAM model.
-        it simply call the IGANN function get_shape_functions_as_dict and then creates the shape functions for the GAM model.
-        This might looks redundant but could be helpful if we want to use a different model for the shape functions.
-        """
-        # TODO: Check if we can use the Base IGANN Shapefunction without manipulating it.
-        shape_data = self.base_model.get_shape_functions_as_dict()
+    def set_shape_data(self, shape_data, intercept=0.0):
+        self.feature_dict = {}
+        self.set_intercept(intercept)
         for feature, feature_dict in shape_data.items():
-            # print(feature_dict["y"])
-            feature_name = feature_dict["name"]
             feature_type = feature_dict["datatype"]
             feature_x = feature_dict["x"]
             feature_y = feature_dict["y"]
-
-            # for categorical features we need use one point per class
             if feature_type == "categorical":
                 feature_x_new = feature_x
                 feature_y_new = feature_y
@@ -520,11 +554,38 @@ class GAMmodel:
                 feature_x_new, feature_y_new = self.create_points(
                     feature_x, feature_y, self.detail
                 )
-            self.feature_dict[feature_name] = {
+            self.feature_dict[feature] = {
                 "datatype": feature_type,
                 "x": feature_x_new,
                 "y": feature_y_new,
             }
+        return
+
+    def set_intercept(self, intercept):
+        self.intercept_ = float(np.asarray(intercept).reshape(-1)[0])
+        return
+
+    def update_feature_dict(self, feat_dict):
+        self.feature_dict.update(feat_dict)
+        return
+
+    def calibrate_intercept(self, X, y_arr):
+        base_without_intercept = np.asarray(self.predict_raw(X, include_intercept=False)).reshape(-1)
+        if self.task == "classification":
+            target_mean = float(np.mean((y_arr >= 0.5).astype(float)))
+            target_mean = min(max(target_mean, 1e-4), 1 - 1e-4)
+            low, high = -12.0, 12.0
+            for _ in range(40):
+                mid = (low + high) / 2
+                probs = 1 / (1 + np.exp(-(base_without_intercept + mid)))
+                if float(np.mean(probs)) < target_mean:
+                    low = mid
+                else:
+                    high = mid
+            self.intercept_ = (low + high) / 2
+        else:
+            self.intercept_ = float(np.mean(y_arr - base_without_intercept))
+        return self.intercept_
 
     def create_points(self, X, Y, num_points):
         """
@@ -553,68 +614,9 @@ class GAMmodel:
 
         return artificial_points_X, artificial_points_Y
 
-    def center_feature_dict(self, X, update_intercept=True):
-        """
-        Center each feature contribution around zero on empirical data X.
-        Shape-function y-values are stored in original target units, while
-        prediction uses scaled units if scale_y=True.
-        """
-        if not self.feature_dict:
-            raise RuntimeError("feature_dict is empty. Call set_shape_functions() first.")
-
-        feature_means = {}
-        intercept_shift_scaled = 0.0
-
-        for feature_name, feature in self.feature_dict.items():
-            if feature_name not in X.columns:
-                continue
-
-            contrib_scaled = np.asarray(self.predict_single(feature_name, X[feature_name]), dtype=float)
-            mu_scaled = float(np.mean(contrib_scaled)) if contrib_scaled.size else 0.0
-            feature_means[feature_name] = mu_scaled
-
-            y_vals = np.asarray(feature.get("y", []), dtype=float)
-            if y_vals.size == 0:
-                continue
-
-            # convert scaled mean back to original target units before editing shape y-values
-            mu_unscaled = float(self.base_model.rescale_y_per_feature(np.array([mu_scaled]))[0])
-            feature["y"] = (y_vals - mu_unscaled).tolist()
-            intercept_shift_scaled += mu_scaled
-
-        if update_intercept:
-            self.base_model.linear_model.intercept_ = (
-                self.base_model.linear_model.intercept_ + intercept_shift_scaled
-            )
-
-        return {
-            "feature_means": feature_means,
-            "intercept_shift": intercept_shift_scaled,
-        }
-
     def predict_single(self, feature_name, x):
-        # Some times we use a interger to get the feature name (not sure why)
-        if type(feature_name) == int:
-            feature_name = self.base_model.feature_names[feature_name]
-
-        # If the feature is not in the feature dict try to handle it like a one-hot encoded one.
-        if feature_name not in self.feature_dict.keys():
-            # reconstuct original feature name
-            new_feature_name = feature_name.rsplit("_", 1)[0]
-            # extract new class name
-            class_name = feature_name.rsplit("_", 1)[-1]
-            # create the new feature
-            x = [
-                (
-                    class_name
-                    if x == 1
-                    # we fill in the class name of the droped feature which results in y = 0
-                    else self.base_model.dropped_features[new_feature_name]
-                )
-                for x in x
-            ]
-            feature_name = new_feature_name
-
+        if feature_name not in self.feature_dict:
+            raise KeyError(f"Unknown GAM feature: {feature_name}")
         feature = self.feature_dict[feature_name]
         if feature["datatype"] == "categorical":
             x_classes = feature["x"]
@@ -632,13 +634,12 @@ class GAMmodel:
             y = np.interp(
                 x, x_values, y_values
             )  # Linear interpolation # also strategies for interpolation beyond x limtis can be created here.
-        # print(len(y))
-        y_scaled = self.base_model.scale_y_per_feature(y)
-        return y_scaled
+        return np.asarray(y, dtype=float)
 
     def predict_raw(
         self,
         X,
+        include_intercept=True,
     ):
         """
         Predict raw values using scaled numerical features and original (raw) categorical features.
@@ -658,9 +659,10 @@ class GAMmodel:
 
         # print(y_scaled)
         # print(self.base_model.linear_model.intercept_)
-        y_predict_raw = y + self.base_model.linear_model.intercept_
+        if include_intercept:
+            y = y + self.intercept_
 
-        return y_predict_raw
+        return y
 
     def get_feature_wise_pred(self, X):
         """

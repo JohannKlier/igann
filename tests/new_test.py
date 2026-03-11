@@ -15,6 +15,7 @@ import math  # Import math module for abs function
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..")))
 
 from igann import IGANN
+from igann import IGANN_interactive
 
 # Set random seed here
 seed = 42
@@ -187,3 +188,53 @@ def test_plot_single(
     igann.fit(X_train, y_train)
 
     igann.plot_single()
+
+
+def test_interactive_fit_from_shape_functions_on_fresh_model():
+    X, y = make_classification(
+        n_samples=200,
+        n_features=6,
+        n_informative=4,
+        random_state=seed,
+    )
+    X = pd.DataFrame(X, columns=[f"feature_{i}" for i in range(X.shape[1])])
+
+    model = IGANN_interactive(n_estimators=5, early_stopping=2, random_state=seed)
+    feature_dict = {
+        col: {
+            "datatype": "numerical",
+            "x": [float(X[col].min()), float(X[col].max())],
+            "y": [0.0, 0.0],
+        }
+        for col in X.columns
+    }
+    model.fit_from_shape_functions(X, y, feature_dict)
+
+    pred = model.predict_raw(X.head(10))
+
+    assert model.GAM is not None
+    assert len(pred) == 10
+
+
+def test_interactive_refit_from_shape_functions_reuses_initialized_state():
+    X, y = make_classification(
+        n_samples=200,
+        n_features=6,
+        n_informative=4,
+        random_state=seed,
+    )
+    X = pd.DataFrame(X, columns=[f"feature_{i}" for i in range(X.shape[1])])
+
+    model = IGANN_interactive(n_estimators=5, early_stopping=2, random_state=seed)
+    model.fit(X, y)
+
+    feature_dict = {
+        feature: dict(values)
+        for feature, values in model.GAM.get_feature_dict().items()
+    }
+    model.fit_from_shape_functions(X, y, feature_dict)
+
+    pred = model.predict_raw(X.head(10))
+
+    assert model.GAM is not None
+    assert len(pred) == 10
