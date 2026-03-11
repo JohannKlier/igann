@@ -5,7 +5,7 @@ from copy import deepcopy
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, FunctionTransformer
+from sklearn.preprocessing import OneHotEncoder, FunctionTransformer, StandardScaler
 from sklearn.linear_model import LogisticRegression, Lasso
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
@@ -187,6 +187,7 @@ class IGANN:
         device="cpu",
         random_state=1,
         verbose=0,
+        scale_y=False,
     ):
         """
         Initializes the model. Input parameters:
@@ -218,6 +219,7 @@ class IGANN:
         self.verbose = verbose
         self.boost_rate = boost_rate
         self.target_remapped_flag = False
+        self.scale_target = scale_y
         """Is set to true during the fit method if the target (y) is remapped to -1 and 1 instead of 0 and 1."""
 
     def _clip_p(self, p):
@@ -287,14 +289,14 @@ class IGANN:
                 "category",
                 "object",
                 "string",
-            ]
+            ]  # String might beneficial for some cases
         ).columns.tolist()
         self.numerical_cols = list(set(X.columns) - set(self.categorical_cols))
 
         # Build a list of (name, transformer, columns)
         transformers = []
-        # if len(self.numerical_cols) > 0:
-        # transformers.append(("num", StandardScaler(), self.numerical_cols))
+        if len(self.numerical_cols) > 0:
+            transformers.append(("num", StandardScaler(), self.numerical_cols))
         if len(self.categorical_cols) > 0:
             transformers.append(
                 (
@@ -318,7 +320,7 @@ class IGANN:
             X_transformed = self.column_transformer.fit_transform(X)
 
             # Create the scaler_dict for inverse transform
-            # self._create_scaler_dict()  # Works only for StandardScaler and num features
+            self._create_scaler_dict()  # Works only for StandardScaler and num features
         else:
             # Use the pre-fitted transformer
             X_transformed = self.column_transformer.transform(X)
@@ -370,6 +372,145 @@ class IGANN:
         # Convert the final DataFrame to PyTorch tensor
         return torch.tensor(X_final.to_numpy(), dtype=torch.float32)
 
+    def _create_scaler_dict(self):
+        """
+        Creates a dictionary that maps each numeric column to a simple
+        inverse-transform function. Soly works for StandardScaler.
+        (x_scaled -> x_unscaled) = (x_scaled * scale + mean).
+        """
+
+        # Safely get the numeric transformer if it exists
+        numeric_transformer = self.column_transformer.named_transformers_.get(
+            "num", None
+        )
+
+        # If we used "passthrough" or there's no numeric transformer, just store an empty dict
+        if numeric_transformer is None or numeric_transformer == "passthrough":
+            self.scaler_dict_ = {}
+            return
+
+        # Otherwise, numeric_transformer is likely a StandardScaler
+        means = numeric_transformer.mean_
+        scales = numeric_transformer.scale_
+
+        # Build the dict
+        self.scaler_dict_ = {}
+        for i, col_name in enumerate(self.numerical_cols):
+            mu = means[i]
+            sigma = scales[i]
+
+            # A small function for inverse scaling
+            def inverse_transform_fn(x, mean=mu, scale=sigma):
+                return x * scale + mean
+
+            self.scaler_dict_[col_name] = inverse_transform_fn
+        # print(self.scaler_dict_)
+
+    def rescale_x(self, feature_name, values):
+        if (
+            # check if scaler_dict is already up
+            hasattr(self, "scaler_dict_")
+            # check if feature name is in numerical cols
+            and feature_name in getattr(self, "numerical_cols", [])
+            # check if feature is in scaler dict
+            and feature_name in self.scaler_dict_
+        ):
+            # get rescaler function
+            rescale_func = self.scaler_dict_[feature_name]
+            # ensure array-like for vectorization
+            values = np.vectorize(rescale_func)(np.asarray(values, dtype=float))
+
+        return values
+
+    def scale_y(self, y, fit_transform=True):
+        """
+        This function scales the target variable y. It is used to ensure that the optimization
+        works well. The scaling is done with a StandardScaler.
+        """
+
+        # Convert y to a numpy array if it is a scalar, list, or any other type
+        if isinstance(y, (float, int)):
+            y = np.array([y])  # Convert scalar to 1D numpy array
+        else:
+            y = np.array(
+                y
+            )  # Convert other types (list, series, dataframe, etc.) to numpy array
+
+        if self.task == "regression" and self.scale_target:
+            # Scale
+            if fit_transform:
+                # set up the normal scaler
+                self.y_scaler = StandardScaler()
+                y_scaled = self.y_scaler.fit_transform(y.reshape(-1, 1)).flatten()
+                # set up the per feature scaler
+                self.y_scaler_per_feature = StandardScaler()
+                # keep sklearn attributes array-shaped for stable transform/inverse_transform
+                self.y_scaler_per_feature.mean_ = np.zeros_like(
+                    self.y_scaler.scale_, dtype=float
+                )  # we don't subtract the mean
+                self.y_scaler_per_feature.scale_ = (
+                    self.y_scaler.scale_
+                )  # we use the same scale
+                self.y_scaler_per_feature.var_ = self.y_scaler_per_feature.scale_ ** 2
+                self.y_scaler_per_feature.n_features_in_ = 1
+
+            else:
+                y_scaled = self.y_scaler.transform(y.reshape(-1, 1)).flatten()
+
+            return y_scaled
+
+        # no scaling
+        else:
+            return y
+
+    def scale_y_per_feature(self, y):
+        """
+        This function scales the target variable y but does not subtract the mean.
+        """
+        # Convert y to a numpy array if it is a scalar, list, or any other type
+        if isinstance(y, (float, int)):
+            y = np.array([y])
+        else:
+            y = np.array(y)
+        if self.task == "regression" and self.scale_target:
+            # rescale y
+            y = self.y_scaler_per_feature.transform(y.reshape(-1, 1)).flatten()
+        return y
+
+    def rescale_y(self, y):
+        """
+        This function rescales the target variable y back to the original scale.
+        """
+
+        # Convert y to a numpy array if it is a scalar, list, or any other type
+        if isinstance(y, (float, int)):
+            y = np.array([y])  # Convert scalar to 1D numpy array
+        else:
+            y = np.array(
+                y
+            )  # Convert other types (list, series, dataframe, etc.) to numpy array
+
+        if self.task == "regression" and self.scale_target:
+            y = self.y_scaler.inverse_transform(y.reshape(-1, 1)).flatten()
+            return y
+        else:
+            return y
+
+    def rescale_y_per_feature(self, y):
+        """
+        This function rescales the target variable y back to the original scale without adding tracting the mean.
+        """
+
+        # Convert y to a numpy array if it is a scalar, list, or any other type
+        if isinstance(y, (float, int)):
+            y = np.array([y])
+        else:
+            y = np.array(y)
+        if self.task == "regression" and self.scale_target:
+            # rescale y
+            y = self.y_scaler_per_feature.inverse_transform(y.reshape(-1, 1)).flatten()
+        return y
+
     def fit(self, X, y, val_set=None):
         """
         This function fits the model on training data (X, y).
@@ -420,6 +561,10 @@ class IGANN:
 
         # Preprocess the feature matrix including scaling and one-hot encoding
         X = self._preprocess_feature_matrix(X)
+
+        # apply scaling to y (is not done for classification)
+        y = self.scale_y(y)
+
         # convert y to tensor
         if type(y) == pd.Series or type(y) == pd.DataFrame:
             y = y.values
@@ -702,7 +847,9 @@ class IGANN:
         Note: for a classification task, it returns the binary target values in a 1-d np.array, it can hold -1 and 1.
         """
         if self.task == "regression":
-            return self.predict_raw(X)
+            y = self.predict_raw(X)
+            y = self.rescale_y(y)
+            return y
         else:
             pred_raw = self.predict_raw(X)
             # detach and numpy pred_raw
@@ -744,6 +891,7 @@ class IGANN:
         return "\n".join(l[p : p + 22] for p in range(0, len(l), 22))
 
     def _get_pred_of_i(self, i, x_values=None):
+        # the big problem is that this works only once and not anymore when we rapped it into a GAM once!
         if x_values == None:
             feat_values = self.unique[i]
         else:
@@ -772,13 +920,17 @@ class IGANN:
                     {
                         "name": feat_name,
                         "datatype": datatype,
-                        "x": feat_values.cpu().numpy(),
-                        "y": pred.numpy(),
+                        # we save this unscaled due to better interpretability
+                        "x": self.scaler_dict_[feat_name](feat_values.cpu().numpy()),
+                        "y": self.rescale_y_per_feature(pred.numpy()),
                         "avg_effect": float(torch.mean(torch.abs(pred))),
                         "hist": {
                             # make this list for eaysier handling and plotting
                             "counts": self.hist[i].hist.cpu().tolist(),
-                            "edges": self.hist[i].bin_edges.cpu().tolist(),
+                            # we save this unscaled due to better interpretability
+                            "edges": self.scaler_dict_[feat_name](
+                                self.hist[i].bin_edges.cpu().numpy()
+                            ),
                         },
                     }
                 )
@@ -789,7 +941,7 @@ class IGANN:
                         "name": feat_name.rsplit("_", 1)[0],
                         "datatype": datatype,
                         "x": [class_name],
-                        "y": [pred.numpy()[1]],
+                        "y": self.rescale_y_per_feature(pred.numpy()[1]),
                         "avg_effect": float(torch.mean(torch.abs(pred))),
                         "hist": {
                             "counts": [self.hist[i][0][-1].cpu().tolist()],
@@ -804,7 +956,9 @@ class IGANN:
             # if the feature is cateogrical we need to add the dropped class to the existing shape function
             if name in final_shape_functions.keys():
                 final_shape_functions[name]["x"].extend(shape_function["x"])
-                final_shape_functions[name]["y"].extend(shape_function["y"])
+                final_shape_functions[name]["y"] = np.append(
+                    final_shape_functions[name]["y"], shape_function["y"]
+                )
                 final_shape_functions[name]["avg_effect"] += shape_function[
                     "avg_effect"
                 ]
@@ -824,13 +978,16 @@ class IGANN:
             if final_shape_functions[name]["datatype"] == "categorical":
                 class_name = str(self.dropped_features[name])
                 final_shape_functions[name]["x"].append(class_name)
-                final_shape_functions[name]["y"].append(0)  # droped class effect is 0
+                final_shape_functions[name]["y"] = np.append(
+                    final_shape_functions[name]["y"], np.array([0])
+                )
 
                 final_shape_functions[name]["hist"]["counts"].append(
                     num_rows - np.sum(final_shape_functions[name]["hist"]["counts"])
                 )
                 final_shape_functions[name]["hist"]["classes"].append(class_name)
 
+        # print(final_shape_functions)
         return final_shape_functions
 
     def plot_single(
@@ -875,7 +1032,7 @@ class IGANN:
         height_ratios = [4, 1] * n_rows  # shape is 4 histogram is 1
 
         # set up figure
-        plt.close(fig="Shape functions")
+        plt.close(fig="shape functions")
         fig, axs = plt.subplots(
             total_rows,
             total_cols,
@@ -892,46 +1049,9 @@ class IGANN:
         # Force axs to be 2D if it is not already
         axs = axs.reshape(total_rows, total_cols)
 
-        def _inverse_transform_x_if_needed(shape_func, scaler_dict):
-            """
-            Inversely transform the shape function's x and y values and histogram edges
-            if:
-            1) shape_func is numeric, AND
-            2) shape_func['name'] is in scaler_dict
-            """
-            # If no scaler_dict is provided, just return as-is
-            if scaler_dict is None:
-                return shape_func
-
-            # if y is in scaler_dict, inverse-transform
-            if "y" in scaler_dict:
-                scaler_func = scaler_dict["y"]
-                shape_func["y"] = np.array(
-                    scale_func(np.array(shape_func["y"]).reshape(-1, 1))
-                )
-
-            # Check if in scaler_dict
-            if shape_func["name"] in scaler_dict:
-                scaler_func = scaler_dict[shape_func["name"]]
-
-                # Inverse-transform x-values
-                x_arr = np.array(shape_func["x"]).reshape(-1, 1)
-                x_inv = scaler_func(x_arr)
-                shape_func["x"] = np.array(x_inv).ravel()
-
-                # Inverse-transform histogram edges
-                edges_arr = np.array(shape_func["hist"]["edges"]).reshape(-1, 1)
-                edges_inv = scaler_func(edges_arr)
-                shape_func["hist"]["edges"] = np.array(edges_inv).ravel()
-
-            return shape_func
-
         # helper function to plot numerical shape
         def _plot_numeric(ax_top, ax_bottom, shape_function):
-            shape_function = _inverse_transform_x_if_needed(shape_function, scaler_dict)
-            # print(shape_function["x"])
-            # print(shape_function["y"])
-            # print(shape_function["hist"]["edges"])
+
             sns.lineplot(
                 x=shape_function["x"],
                 y=shape_function["y"],
@@ -950,7 +1070,6 @@ class IGANN:
 
         # helper function to plot categorical shape
         def _plot_categorical(ax_top, ax_bottom, shape_function):
-            shape_function = _inverse_transform_x_if_needed(shape_function, scaler_dict)
             ax_top.bar(
                 x=shape_function["x"],
                 height=shape_function["y"],

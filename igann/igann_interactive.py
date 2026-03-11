@@ -25,7 +25,7 @@ from sklearn.metrics import (
 
 
 class _LinearInitModel:
-    """Minimal linear-model stub used when initializing from edited shape functions."""
+    """Minimal linear container for GAM-initialized refits."""
 
     def __init__(self, coef, intercept):
         self.coef_ = coef
@@ -57,8 +57,36 @@ class IGANN_interactive(IGANN):
         self.GAM = None
         self.GAM_detail = GAM_detail
         self.regressor_limit = regressor_limit
-        self.residual_model = None
-        self.residual_feature_names = []
+        self._compress_after_optimization = True
+        self._refit_feature_cols = None
+        self._saved_train_indices = None
+        self._saved_val_indices = None
+        self._saved_split_index_values = None
+
+    def _get_or_create_split_indices(self, X, y_arr):
+        """Reuse a saved train/val split for stable iterative refits when possible."""
+        current_index_values = np.asarray(X.index)
+        can_reuse = (
+            self._saved_train_indices is not None
+            and self._saved_val_indices is not None
+            and self._saved_split_index_values is not None
+            and len(self._saved_split_index_values) == len(X)
+            and np.array_equal(self._saved_split_index_values, current_index_values)
+        )
+        if can_reuse:
+            return self._saved_train_indices, self._saved_val_indices
+
+        indices = np.arange(len(X))
+        train_indices, val_indices = train_test_split(
+            indices,
+            test_size=0.15,
+            stratify=y_arr if self.task == "classification" else None,
+            random_state=self.random_state,
+        )
+        self._saved_train_indices = train_indices
+        self._saved_val_indices = val_indices
+        self._saved_split_index_values = current_index_values.copy()
+        return train_indices, val_indices
 
     def _run_optimization(self, X, y, y_hat, X_val, y_val, y_hat_val, best_loss):
         """
@@ -79,7 +107,7 @@ class IGANN_interactive(IGANN):
         # Sequentially fit one ELM after the other. Max number is stored in self.n_estimators.
         for counter in range(self.n_estimators):
             #### Start - addtional code for IGANN_interactive #####
-            if len(self.regressors) > self.regressor_limit:
+            if self._compress_after_optimization and len(self.regressors) > self.regressor_limit:
                 print("Reached regressor limit compressing GAM")
                 if self.GAMwrapper == True:
                     self.compress_to_GAM()
@@ -108,13 +136,13 @@ class IGANN_interactive(IGANN):
             )
 
             # Fit ELM regressor
-            mult_coef = (
+            X_hid = regressor.fit(
+                X,
+                y_tilde,
                 torch.sqrt(torch.tensor(0.5).to(self.device))
                 * self.boost_rate
-                * hessian_train_sqrt[:, None]
+                * hessian_train_sqrt[:, None],
             )
-
-            X_hid = regressor.fit(X, y_tilde, mult_coef)
 
             # Make a prediction of the ELM for the update of y_hat
             train_regressor_pred = regressor.predict(X_hid, hidden=True).squeeze()
@@ -173,7 +201,7 @@ class IGANN_interactive(IGANN):
             self.boosting_rates = self.boosting_rates[:best_iter]
 
         # if we use the GAMwrapper, we compress the ELMs to a GAM model in the end of the optimization
-        if self.GAMwrapper == True:
+        if self.GAMwrapper == True and self._compress_after_optimization:
             self.compress_to_GAM()
 
         return best_loss
@@ -194,12 +222,20 @@ class IGANN_interactive(IGANN):
             pred_shape = (
                 self.linear_model.coef_.astype(np.float32) @ X.transpose()
             ).squeeze()
-            # add the intercept when no GAM wrapper handles it already
+        # GAM.predict_raw already includes intercept; only add it in non-GAM branch.
+        if not (self.GAMwrapper == True and self.GAM is not None):
             pred_shape += self.linear_model.intercept_
 
         # if we have regressors we use them to further imporve the prediction
         if len(self.regressors) > 0:
-            X = self._preprocess_feature_matrix(X, fit_transform=False).to(self.device)
+            X_for_reg = X
+            if (
+                self._refit_feature_cols is not None
+                and isinstance(X, pd.DataFrame)
+                and all(col in X.columns for col in self._refit_feature_cols)
+            ):
+                X_for_reg = X[self._refit_feature_cols].copy()
+            X = self._preprocess_feature_matrix(X_for_reg, fit_transform=False).to(self.device)
 
             pred_nn = torch.zeros(len(X), dtype=torch.float32).to(self.device)
             for boost_rate, regressor in zip(self.boosting_rates, self.regressors):
@@ -217,198 +253,9 @@ class IGANN_interactive(IGANN):
             # + (self.linear_model.coef_.astype(np.float32) @ X.transpose()).squeeze()
             # + self.linear_model.intercept_
         )
-        pred += self._predict_residual_raw(X)
         #### End - addtional code for IGANN_interactive #####
 
         return pred
-
-    def _predict_residual_raw(self, X):
-        """Return raw predictions of the unlocked-feature booster, if present."""
-        if self.residual_model is None or not self.residual_feature_names:
-            return 0
-        if not isinstance(X, pd.DataFrame):
-            return 0
-        X_residual = X[self.residual_feature_names].copy()
-        return self.residual_model.predict_raw(X_residual)
-
-    def _initialize_shape_function_state(self, X, y):
-        """Fit preprocessing/target scaling state without learning a fresh GAM."""
-        if not isinstance(X, pd.DataFrame):
-            raise ValueError("X must be a pandas DataFrame.")
-
-        self.raw_X = X.copy()
-        indices = np.arange(len(X))
-        train_indices, val_indices = train_test_split(
-            indices,
-            test_size=0.15,
-            stratify=y if self.task == "classification" else None,
-            random_state=self.random_state,
-        )
-        self.raw_X_train = X.iloc[train_indices]
-        self.raw_X_val = X.iloc[val_indices]
-        if type(y) == pd.Series or type(y) == pd.DataFrame:
-            self.raw_y_train = y.iloc[train_indices]
-            self.raw_y_val = y.iloc[val_indices]
-
-        self._reset_state()
-        X_proc = self._preprocess_feature_matrix(X)
-        _ = self.scale_y(y, fit_transform=True)
-
-        self.X_min = list(X_proc.min(axis=0))
-        self.X_max = list(X_proc.max(axis=0))
-        self.unique = [torch.unique(X_proc[:, i]) for i in range(X_proc.shape[1])]
-        self.hist = [torch.histogram(X_proc[:, i]) for i in range(X_proc.shape[1])]
-
-        coef_shape = (1, len(self.feature_names)) if self.task == "classification" else len(self.feature_names)
-        self.linear_model = _LinearInitModel(
-            coef=np.zeros(coef_shape, dtype=np.float32),
-            intercept=0.0,
-        )
-
-    def _set_base_shape_functions(self, feature_dict):
-        """Install edited feature shapes as the current GAM state."""
-        self.GAM = GAMmodel(self, self.task, self.GAM_detail)
-        self.GAM.set_feature_dict(deepcopy(feature_dict))
-
-    def _get_base_feature_dict(self):
-        if self.GAM is None:
-            return {}
-        return self.GAM.feature_dict
-
-    def _merge_numeric_feature_dicts(self, base_feature, delta_feature):
-        base_x = np.asarray(base_feature.get("x", []), dtype=float)
-        base_y = np.asarray(base_feature.get("y", []), dtype=float)
-        delta_x = np.asarray(delta_feature.get("x", []), dtype=float)
-        delta_y = np.asarray(delta_feature.get("y", []), dtype=float)
-        if base_x.size == 0:
-            return {
-                "datatype": "numerical",
-                "x": delta_x.tolist(),
-                "y": delta_y.tolist(),
-            }
-        if delta_x.size == 0:
-            return deepcopy(base_feature)
-
-        point_count = max(len(base_x), len(delta_x), int(self.GAM_detail))
-        target_x = np.linspace(
-            min(float(base_x.min()), float(delta_x.min())),
-            max(float(base_x.max()), float(delta_x.max())),
-            point_count,
-        )
-        base_interp = np.interp(target_x, base_x, base_y)
-        delta_interp = np.interp(target_x, delta_x, delta_y)
-        return {
-            "datatype": "numerical",
-            "x": target_x.tolist(),
-            "y": (base_interp + delta_interp).tolist(),
-        }
-
-    def _merge_categorical_feature_dicts(self, base_feature, delta_feature):
-        categories = []
-        for value in list(base_feature.get("x", [])) + list(delta_feature.get("x", [])):
-            value = str(value)
-            if value not in categories:
-                categories.append(value)
-
-        base_map = {
-            str(cat): float(base_feature.get("y", [])[i])
-            for i, cat in enumerate(base_feature.get("x", []))
-            if i < len(base_feature.get("y", []))
-        }
-        delta_map = {
-            str(cat): float(delta_feature.get("y", [])[i])
-            for i, cat in enumerate(delta_feature.get("x", []))
-            if i < len(delta_feature.get("y", []))
-        }
-        return {
-            "datatype": "categorical",
-            "x": categories,
-            "y": [base_map.get(cat, 0.0) + delta_map.get(cat, 0.0) for cat in categories],
-        }
-
-    def _get_effective_feature_dict(self):
-        """Combine edited base GAM shapes with the unlocked residual booster."""
-        combined = deepcopy(self._get_base_feature_dict())
-        if self.residual_model is None:
-            return combined
-
-        delta_shapes = self.residual_model.get_shape_functions_as_dict()
-        locked = {str(name) for name in getattr(self, "locked_feature_names", [])}
-        for feature_name, delta_feature in delta_shapes.items():
-            if feature_name in locked:
-                continue
-
-            base_feature = combined.get(feature_name)
-            if not base_feature:
-                combined[feature_name] = deepcopy(delta_feature)
-                continue
-
-            if delta_feature.get("datatype") == "categorical" or base_feature.get("datatype") == "categorical":
-                combined[feature_name] = self._merge_categorical_feature_dicts(base_feature, delta_feature)
-            else:
-                combined[feature_name] = self._merge_numeric_feature_dicts(base_feature, delta_feature)
-
-        return combined
-
-    def fit_from_shape_functions(
-        self,
-        X,
-        y,
-        feature_dict,
-        locked_features=None,
-        refit_estimators=0,
-        refit_early_stopping=None,
-    ):
-        """
-        Build an interactive model directly from edited shape functions and learn
-        a residual booster only on unlocked features.
-        """
-        self.locked_feature_names = [str(name) for name in (locked_features or [])]
-        self.residual_model = None
-        self.residual_feature_names = []
-
-        self._initialize_shape_function_state(X, y)
-        self._set_base_shape_functions(feature_dict)
-
-        target_scaled = self.scale_y(y, fit_transform=False)
-        if type(target_scaled) == pd.Series or type(target_scaled) == pd.DataFrame:
-            target_scaled = target_scaled.values
-        target_scaled = np.asarray(target_scaled).reshape(-1)
-        base_pred_without_intercept = np.asarray(self.GAM.predict_raw(X)).reshape(-1)
-        self.linear_model.intercept_ = float(
-            np.mean(target_scaled - base_pred_without_intercept)
-        )
-
-        unlocked_features = [
-            str(col) for col in X.columns if str(col) not in set(self.locked_feature_names)
-        ]
-        self.residual_feature_names = unlocked_features
-        if refit_estimators <= 0 or len(unlocked_features) == 0:
-            return self
-
-        base_prediction = np.asarray(self.predict(X)).reshape(-1)
-        residual_target = np.asarray(y).reshape(-1) - base_prediction
-
-        residual_model = IGANN(
-            task="regression",
-            n_hid=self.n_hid,
-            n_estimators=refit_estimators,
-            boost_rate=self.boost_rate,
-            init_reg=self.init_reg,
-            elm_scale=self.elm_scale,
-            elm_alpha=self.elm_alpha,
-            act=self.act,
-            early_stopping=(
-                refit_early_stopping if refit_early_stopping is not None else self.early_stopping
-            ),
-            device=self.device,
-            random_state=self.random_state,
-            verbose=self.verbose,
-            scale_y=self.scale_target,
-        )
-        residual_model.fit(X[unlocked_features].copy(), residual_target)
-        self.residual_model = residual_model
-        return self
 
     def _get_pred_of_i(self, i, x_values=None):
         # print("get_pred_of_i of igann_interactive")
@@ -425,7 +272,7 @@ class IGANN_interactive(IGANN):
             # print(self.scaler_dict_.keys())
             # print("feat_values before")
             # print(feat_values)
-            if feat_name in self.scaler_dict_.keys():
+            if hasattr(self, "scaler_dict_") and feat_name in self.scaler_dict_.keys():
                 raw_feat_values = self.rescale_x(feat_name, feat_values)
             else:
                 raw_feat_values = feat_values
@@ -448,6 +295,121 @@ class IGANN_interactive(IGANN):
                 * regressor.predict_single(feat_values.reshape(-1, 1), i).squeeze()
             ).cpu()
         return feat_values, pred
+
+    def fit_from_shape_functions(
+        self,
+        X,
+        y,
+        feature_dict,
+    ):
+        """
+        Initialize the model from edited GAM shape functions and train new ELM
+        regressors on top using a selected subset of features.
+        """
+        if not isinstance(X, pd.DataFrame):
+            raise ValueError("X must be a pandas DataFrame.")
+
+        fit_cols = [str(c) for c in X.columns]
+        if len(fit_cols) == 0:
+            raise ValueError("No features available for refit.")
+        self._refit_feature_cols = list(fit_cols)
+
+        y_arr_raw = np.asarray(y).reshape(-1)
+        train_indices, val_indices = self._get_or_create_split_indices(X, y_arr_raw)
+
+        # Keep full raw X for GAM predictions.
+        self.raw_X = X.copy()
+        self.raw_X_train = X.iloc[train_indices]
+        self.raw_X_val = X.iloc[val_indices]
+        if type(y) == pd.Series or type(y) == pd.DataFrame:
+            self.raw_y_train = y.iloc[train_indices]
+            self.raw_y_val = y.iloc[val_indices]
+
+        self._reset_state()
+        X_fit = X[fit_cols].copy()
+        X_proc = self._preprocess_feature_matrix(X_fit, fit_transform=True)
+        self.X_min = list(X_proc.min(axis=0))
+        self.X_max = list(X_proc.max(axis=0))
+        self.unique = [torch.unique(X_proc[:, i]) for i in range(X_proc.shape[1])]
+        self.hist = [torch.histogram(X_proc[:, i]) for i in range(X_proc.shape[1])]
+
+        y_arr = y_arr_raw
+        if self.task == "regression":
+            y_arr = self.scale_y(y_arr_raw, fit_transform=True)
+        y_torch = torch.from_numpy(y_arr.squeeze()).float()
+        if self.task == "classification":
+            self.criterion = lambda prediction, target: torch.nn.BCEWithLogitsLoss()(
+                prediction, torch.nn.ReLU()(target)
+            )
+            if torch.min(y_torch) != -1:
+                self.target_remapped_flag = True
+                y_torch = 2 * y_torch - 1
+            coef_shape = (1, len(self.feature_names))
+        elif self.task == "regression":
+            self.criterion = torch.nn.MSELoss()
+            coef_shape = len(self.feature_names)
+        else:
+            raise ValueError("Task not implemented. Can be classification or regression")
+
+        # Install edited GAM as base model and use zero linear weights.
+        self.linear_model = _LinearInitModel(
+            coef=np.zeros(coef_shape, dtype=np.float32),
+            intercept=0.0,
+        )
+        self.GAM = GAMmodel(self, self.task, self.GAM_detail)
+        self.GAM.set_feature_dict(deepcopy(feature_dict))
+
+        # Calibrate intercept from current GAM baseline.
+        base_pred = np.asarray(self.GAM.predict_raw(X)).reshape(-1)
+        if self.task == "classification":
+            target_mean = float(np.mean((y_arr >= 0.5).astype(float)))
+            target_mean = min(max(target_mean, 1e-4), 1 - 1e-4)
+            low, high = -12.0, 12.0
+            for _ in range(40):
+                mid = (low + high) / 2
+                probs = 1 / (1 + np.exp(-(base_pred + mid)))
+                if float(np.mean(probs)) < target_mean:
+                    low = mid
+                else:
+                    high = mid
+            self.linear_model.intercept_ = (low + high) / 2
+        else:
+            self.linear_model.intercept_ = float(np.mean(y_arr - base_pred))
+
+        X_train = X_proc[train_indices]
+        X_val = X_proc[val_indices]
+        y_train = y_torch[train_indices]
+        y_val = y_torch[val_indices]
+        y_hat_train = torch.tensor(self.predict_raw(self.raw_X_train), dtype=torch.float32)
+        y_hat_val = torch.tensor(self.predict_raw(self.raw_X_val), dtype=torch.float32)
+        best_loss = self.criterion(y_hat_val, y_val)
+
+        X_train, y_train, y_hat_train, X_val, y_val, y_hat_val = (
+            X_train.to(self.device),
+            y_train.to(self.device),
+            y_hat_train.to(self.device),
+            X_val.to(self.device),
+            y_val.to(self.device),
+            y_hat_val.to(self.device),
+        )
+
+        # Keep edited GAM as base; do not recompress after this optimization.
+        prev_flag = self._compress_after_optimization
+        self._compress_after_optimization = False
+        try:
+            self._run_optimization(
+                X_train,
+                y_train,
+                y_hat_train,
+                X_val,
+                y_val,
+                y_hat_val,
+                best_loss,
+            )
+        finally:
+            self._compress_after_optimization = prev_flag
+
+        return self
 
     #### Start - addtional code for IGANN_interactive #####
     def compress_to_GAM(self):
@@ -487,10 +449,8 @@ class IGANN_interactive(IGANN):
 
     def center_shape_functions(self, X=None, update_intercept=True):
         """
-        Enforce an empirical centering constraint E[f_j(X_j)] = 0 for all feature
-        shape functions in the GAM representation.
-
-        This is optional and not called automatically.
+        Center GAM feature functions so E[f_j(X_j)] = 0 on reference data X.
+        If X is None, use raw_X_train/raw_X from the most recent fit.
         """
         if self.GAM is None:
             self.compress_to_GAM()
@@ -501,9 +461,7 @@ class IGANN_interactive(IGANN):
             elif hasattr(self, "raw_X"):
                 X = self.raw_X
             else:
-                raise RuntimeError(
-                    "No reference data available. Provide X explicitly."
-                )
+                raise RuntimeError("No reference data available. Provide X explicitly.")
 
         return self.GAM.center_feature_dict(X, update_intercept=update_intercept)
 
@@ -529,8 +487,6 @@ class GAMmodel:
         # print(self.base_model.feature_names)
 
     def get_feature_dict(self):
-        if hasattr(self.base_model, "_get_effective_feature_dict"):
-            return self.base_model._get_effective_feature_dict()
         return self.feature_dict
 
     def set_feature_dict(self, feat_dict):
@@ -570,43 +526,6 @@ class GAMmodel:
                 "y": feature_y_new,
             }
 
-    def center_feature_dict(self, X, update_intercept=True):
-        """
-        Center each feature contribution around zero on reference data X by
-        subtracting the empirical mean contribution from the feature's shape.
-        Optionally add the removed mass back to the model intercept to preserve
-        overall predictions.
-        """
-        if not self.feature_dict:
-            raise RuntimeError("feature_dict is empty. Call set_shape_functions() first.")
-
-        feature_means = {}
-        intercept_shift = 0.0
-
-        for feature_name, feature in self.feature_dict.items():
-            if feature_name not in X.columns:
-                continue
-
-            contrib = np.asarray(self.predict_single(feature_name, X[feature_name]))
-            mu = float(np.mean(contrib)) if contrib.size else 0.0
-            feature_means[feature_name] = mu
-
-            y_vals = np.asarray(feature.get("y", []), dtype=float)
-            if y_vals.size == 0:
-                continue
-            feature["y"] = (y_vals - mu).tolist()
-            intercept_shift += mu
-
-        if update_intercept:
-            self.base_model.linear_model.intercept_ = (
-                self.base_model.linear_model.intercept_ + intercept_shift
-            )
-
-        return {
-            "feature_means": feature_means,
-            "intercept_shift": intercept_shift,
-        }
-
     def create_points(self, X, Y, num_points):
         """
         this function creates the points for the shape functions that are saved for numeric features.
@@ -633,6 +552,45 @@ class GAMmodel:
             artificial_points_Y.append(y)
 
         return artificial_points_X, artificial_points_Y
+
+    def center_feature_dict(self, X, update_intercept=True):
+        """
+        Center each feature contribution around zero on empirical data X.
+        Shape-function y-values are stored in original target units, while
+        prediction uses scaled units if scale_y=True.
+        """
+        if not self.feature_dict:
+            raise RuntimeError("feature_dict is empty. Call set_shape_functions() first.")
+
+        feature_means = {}
+        intercept_shift_scaled = 0.0
+
+        for feature_name, feature in self.feature_dict.items():
+            if feature_name not in X.columns:
+                continue
+
+            contrib_scaled = np.asarray(self.predict_single(feature_name, X[feature_name]), dtype=float)
+            mu_scaled = float(np.mean(contrib_scaled)) if contrib_scaled.size else 0.0
+            feature_means[feature_name] = mu_scaled
+
+            y_vals = np.asarray(feature.get("y", []), dtype=float)
+            if y_vals.size == 0:
+                continue
+
+            # convert scaled mean back to original target units before editing shape y-values
+            mu_unscaled = float(self.base_model.rescale_y_per_feature(np.array([mu_scaled]))[0])
+            feature["y"] = (y_vals - mu_unscaled).tolist()
+            intercept_shift_scaled += mu_scaled
+
+        if update_intercept:
+            self.base_model.linear_model.intercept_ = (
+                self.base_model.linear_model.intercept_ + intercept_shift_scaled
+            )
+
+        return {
+            "feature_means": feature_means,
+            "intercept_shift": intercept_shift_scaled,
+        }
 
     def predict_single(self, feature_name, x):
         # Some times we use a interger to get the feature name (not sure why)
