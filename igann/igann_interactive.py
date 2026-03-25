@@ -297,15 +297,41 @@ class IGANN_interactive(IGANN):
         X,
         y,
         feature_dict,
+        exclude_from_boosting=None,
+        reset_features=None,
     ):
         """
         Initialize the model from edited GAM shape functions and train new ELM
         regressors on top using a selected subset of features.
+
+        Parameters
+        ----------
+        X : pd.DataFrame
+            Feature matrix.
+        y : array-like
+            Targets.
+        feature_dict : dict
+            Shape functions dict (same format as get_gam_feature_dict()).
+        exclude_from_boosting : list of str, optional
+            Feature names whose shape functions are frozen. ELMs will not learn
+            any contribution for these features during the boosting step.
+        reset_features : list of str, optional
+            Feature names whose shape functions are reset to a flat zero line
+            before boosting, so the ELMs learn them from scratch.
         """
         if not isinstance(X, pd.DataFrame):
             raise ValueError("X must be a pandas DataFrame.")
 
-        fit_cols = [str(c) for c in X.columns]
+        # Reset specified features to zero before using them as GAM base
+        if reset_features:
+            feature_dict = deepcopy(feature_dict)
+            for fname in reset_features:
+                if fname in feature_dict:
+                    feat = feature_dict[fname]
+                    feat["y"] = [0.0] * len(feat.get("y", []))
+
+        excluded = set(exclude_from_boosting) if exclude_from_boosting else set()
+        fit_cols = [str(c) for c in X.columns if str(c) not in excluded]
         if len(fit_cols) == 0:
             raise ValueError("No features available for refit.")
         self._refit_feature_cols = list(fit_cols)
@@ -313,7 +339,7 @@ class IGANN_interactive(IGANN):
         y_arr_raw = np.asarray(y).reshape(-1)
         train_indices, val_indices = self._get_or_create_split_indices(X, y_arr_raw)
 
-        # Keep full raw X for GAM predictions.
+        # Keep full raw X so the GAM can predict all features in y_hat_train/val.
         self.raw_X = X.copy()
         self.raw_X_train = X.iloc[train_indices]
         self.raw_X_val = X.iloc[val_indices]
@@ -384,6 +410,47 @@ class IGANN_interactive(IGANN):
             self._compress_after_optimization = prev_flag
 
         return self
+
+    def continue_fit(
+        self,
+        X,
+        y,
+        reset_features=None,
+        exclude_from_boosting=None,
+    ):
+        """
+        Continue fitting the model from the current GAM state.
+
+        Uses the current shape functions as the starting point and runs another
+        round of boosting on top. Optionally resets selected features to a flat
+        zero shape so boosting can re-learn them from scratch, and/or freezes
+        other features so boosting cannot change them.
+
+        Parameters
+        ----------
+        X : pd.DataFrame
+            Feature matrix (same as used for the original fit).
+        y : array-like
+            Targets.
+        reset_features : list of str, optional
+            Feature names whose shape functions are set to zero before the next
+            boosting round. The ELMs will learn these features from scratch.
+        exclude_from_boosting : list of str, optional
+            Feature names that are frozen. Their current shape functions are
+            preserved and ELMs will not add any contribution for them.
+        """
+        if self.GAM is None or not self.GAM.feature_dict:
+            raise RuntimeError(
+                "No GAM shape functions available. Call fit() or fit_from_shape_functions() first."
+            )
+        feature_dict = self.get_gam_feature_dict(scaled=False)
+        return self.fit_from_shape_functions(
+            X,
+            y,
+            feature_dict,
+            exclude_from_boosting=exclude_from_boosting,
+            reset_features=reset_features,
+        )
 
     #### Start - addtional code for IGANN_interactive #####
     def compress_to_GAM(self):
