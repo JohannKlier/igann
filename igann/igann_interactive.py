@@ -1,27 +1,11 @@
 from igann import IGANN
 from igann import ELM_Regressor
 
-# not sure if we need everything here..... clean later!
-import time
 import torch
-import warnings
 from copy import deepcopy
 import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, FunctionTransformer
-from sklearn.linear_model import LogisticRegression, Lasso
 from sklearn.model_selection import train_test_split
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import (
-    mean_squared_error,
-    r2_score,
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-)
 
 
 class IGANN_interactive(IGANN):
@@ -46,7 +30,6 @@ class IGANN_interactive(IGANN):
         *args,
         GAM_detail=100,
         regressor_limit=100,
-        GAMwrapper=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -108,9 +91,7 @@ class IGANN_interactive(IGANN):
 
         # Sequentially fit one ELM after the other. Max number is stored in self.n_estimators.
         for counter in range(self.n_estimators):
-            #### Start - addtional code for IGANN_interactive #####
             if self._compress_after_optimization and len(self.regressors) > self.regressor_limit:
-                print("Reached regressor limit compressing GAM")
                 self.compress_to_GAM()
                 y_hat = torch.tensor(
                     self.predict_raw(self.raw_X_train), dtype=torch.float32
@@ -118,7 +99,6 @@ class IGANN_interactive(IGANN):
                 y_hat_val = torch.tensor(
                     self.predict_raw(self.raw_X_val), dtype=torch.float32
                 )
-            #### End - addtional code for IGANN_interactive #####
             hessian_train_sqrt = self._loss_sqrt_hessian(y, y_hat)
             y_tilde = torch.sqrt(torch.tensor(0.5).to(self.device)) * self._get_y_tilde(
                 y, y_hat
@@ -212,21 +192,18 @@ class IGANN_interactive(IGANN):
         This function returns a prediction for a given feature matrix X.
         Note: for a classification task, it returns the raw logit values.
         """
-        #### Start - addtional code for IGANN_interactive #####
-        # If GAM shape functions are available, use them as the base predictor.
-        if self.GAM is not None and self.GAM.feature_dict:
-            # As the GAM uses shape function that are not scaled or one-hot encoded we will >>not<< preprocess the data.
+        gam_active = self.GAM is not None and self.GAM.feature_dict
+        if gam_active:
+            # GAM uses raw (unscaled, un-encoded) data and includes the intercept.
             pred_shape = self.GAM.predict_raw(X)
         else:
             # Fallback before GAM state exists during initial fit.
             pred_shape = (
                 self.linear_model.coef_.astype(np.float32) @ X.transpose()
             ).squeeze()
-        # GAM.predict_raw already includes intercept; only add it in non-GAM branch.
-        if not (self.GAM is not None and self.GAM.feature_dict):
             pred_shape += self.linear_model.intercept_
 
-        # if we have regressors we use them to further imporve the prediction
+        pred_nn = 0
         if len(self.regressors) > 0:
             X_for_reg = X
             if (
@@ -235,56 +212,31 @@ class IGANN_interactive(IGANN):
                 and all(col in X.columns for col in self._refit_feature_cols)
             ):
                 X_for_reg = X[self._refit_feature_cols].copy()
-            X = self._preprocess_feature_matrix(X_for_reg, fit_transform=False).to(self.device)
+            X_proc = self._preprocess_feature_matrix(X_for_reg, fit_transform=False).to(self.device)
 
-            pred_nn = torch.zeros(len(X), dtype=torch.float32).to(self.device)
+            pred_nn_tensor = torch.zeros(len(X_proc), dtype=torch.float32).to(self.device)
             for boost_rate, regressor in zip(self.boosting_rates, self.regressors):
-                pred_nn += boost_rate * regressor.predict(X).squeeze()
-            pred_nn = pred_nn.detach().cpu().numpy()
-            # convert back to numpy for further calculations
-            X = X.detach().cpu().numpy()
+                pred_nn_tensor += boost_rate * regressor.predict(X_proc).squeeze()
+            pred_nn = pred_nn_tensor.detach().cpu().numpy()
 
-        # add pred_nn and pred_shape to get the final prediction if they exits.
-        pred_combined = locals().get("pred_shape", 0) + locals().get("pred_nn", 0)
-
-        pred = (
-            pred_combined
-            # + pred_nn
-            # + (self.linear_model.coef_.astype(np.float32) @ X.transpose()).squeeze()
-            # + self.linear_model.intercept_
-        )
-        #### End - addtional code for IGANN_interactive #####
-
-        return pred
+        return pred_shape + pred_nn
 
     def _get_pred_of_i(self, i, x_values=None):
-        # print("get_pred_of_i of igann_interactive")
-        # print(self.feature_names)
         feat_name = self.feature_names[i]
-        if x_values == None:
-            feat_values = self.unique[i]
-        else:
-            feat_values = x_values[i]
+        feat_values = self.unique[i] if x_values is None else x_values[i]
 
-        #### Start - addtional code for IGANN_interactive #####
-        # If GAM shape functions are available, use them for partial predictions.
         if self.GAM and self.GAM.feature_dict:
             gam_feature_name, raw_feat_values = self._resolve_gam_feature_input(
                 feat_name, feat_values
             )
-            pred = self.GAM.predict_single(gam_feature_name, raw_feat_values)
-            pred = torch.from_numpy(np.array(pred))
-        #### End - addtional code for IGANN_interactive #####
-
+            pred = torch.from_numpy(np.array(self.GAM.predict_single(gam_feature_name, raw_feat_values)))
         else:
             if self.task == "classification":
                 pred = self.linear_model.coef_[0, i] * feat_values
             else:
                 pred = self.linear_model.coef_[i] * feat_values
-        # print(pred)
 
         feat_values = feat_values.to(self.device)
-        # print(f"Regressors: {len(self.regressors)}")
         for regressor, boost_rate in zip(self.regressors, self.boosting_rates):
             pred += (
                 boost_rate
@@ -343,7 +295,7 @@ class IGANN_interactive(IGANN):
         self.raw_X = X.copy()
         self.raw_X_train = X.iloc[train_indices]
         self.raw_X_val = X.iloc[val_indices]
-        if type(y) == pd.Series or type(y) == pd.DataFrame:
+        if isinstance(y, (pd.Series, pd.DataFrame)):
             self.raw_y_train = y.iloc[train_indices]
             self.raw_y_val = y.iloc[val_indices]
 
@@ -452,12 +404,10 @@ class IGANN_interactive(IGANN):
             reset_features=reset_features,
         )
 
-    #### Start - addtional code for IGANN_interactive #####
     def compress_to_GAM(self):
         """
         Compress the model to a GAM model. This is useful if the model is too large and the user wants to make fast predictions.
         """
-        print("Compressing to GAM")
         if self.GAM is None:
             self.GAM = GAMmodel(task=self.task, detail=self.GAM_detail)
         self.GAM.set_shape_data(
@@ -465,7 +415,7 @@ class IGANN_interactive(IGANN):
             intercept=self._get_linear_intercept(),
         )
 
-        # ass we now use the shape function for the prediction we do not need the regressors or bossting rates.
+        # Shape functions now encode the full prediction; regressors are no longer needed.
         self.regressors = []
         self.boosting_rates = []
 
@@ -475,21 +425,9 @@ class IGANN_interactive(IGANN):
         run_igann_interactive(self)
 
     def get_feature_wise_pred(self, X):
-        if self.GAM is not None:
-            y = pd.DataFrame(self.GAM.get_feature_wise_pred(X))
-        else:
-            print(
-                "fist the model should be compressed to a GAM. Try to call 'compress_to_GAM'-function."
-            )
-        return y
-
-    def get_feature_wise_pred_as_dict(self, X):
-        """
-        this does not work jet ...
-        """
-        # y = self.get_feature_wise_pred(X)
-        # for
-        # for featue in y.Columns():
+        if self.GAM is None:
+            raise RuntimeError("Compress model to GAM first by calling compress_to_GAM().")
+        return pd.DataFrame(self.GAM.get_feature_wise_pred(X))
 
     def center_shape_functions(self, X=None, update_intercept=True):
         """
@@ -586,12 +524,10 @@ class IGANN_interactive(IGANN):
             feature["y"] = self.rescale_y_per_feature(y_values).tolist()
         return feature_dict
 
-    #### End - addtional code for IGANN_interactive #####
-
 
 class GAMmodel:
     """
-    This is a wrapper class for the GAM model it handels the alternative functions that are based on the shapefunctions.
+    Wrapper that stores shape functions and performs predictions from them.
     """
 
     def __init__(self, task, detail=100):
@@ -605,7 +541,6 @@ class GAMmodel:
 
     def set_feature_dict(self, feat_dict):
         self.feature_dict = feat_dict
-        return
 
     def set_shape_data(self, shape_data, intercept=0.0):
         self.feature_dict = {}
@@ -626,15 +561,12 @@ class GAMmodel:
                 "x": feature_x_new,
                 "y": feature_y_new,
             }
-        return
 
     def set_intercept(self, intercept):
         self.intercept_ = float(np.asarray(intercept).reshape(-1)[0])
-        return
 
     def update_feature_dict(self, feat_dict):
         self.feature_dict.update(feat_dict)
-        return
 
     def calibrate_intercept(self, X, y_arr):
         base_without_intercept = np.asarray(self.predict_raw(X, include_intercept=False)).reshape(-1)
@@ -655,31 +587,9 @@ class GAMmodel:
         return self.intercept_
 
     def create_points(self, X, Y, num_points):
-        """
-        this function creates the points for the shape functions that are saved for numeric features.
-        """
-        min_x, max_x = min(X), max(X)
-        x_values = np.linspace(min_x, max_x, num_points)
-        artificial_points_X = []
-        artificial_points_Y = []
-
-        for x in x_values:
-            # Find the indices of the points on either side of x
-            idx1 = np.searchsorted(X, x)
-            if idx1 == 0:
-                y = Y[0]
-            elif idx1 == len(X):
-                y = Y[-1]
-            else:
-                x1, y1 = X[idx1 - 1], Y[idx1 - 1]
-                x2, y2 = X[idx1], Y[idx1]
-                # Compute the weighted average of the y-values of the points on either side
-                y = y1 + (x - x1) * (y2 - y1) / (x2 - x1)
-            # Append the artificial point
-            artificial_points_X.append(x)
-            artificial_points_Y.append(y)
-
-        return artificial_points_X, artificial_points_Y
+        """Resample shape function to num_points via linear interpolation."""
+        x_values = np.linspace(min(X), max(X), num_points)
+        return x_values.tolist(), np.interp(x_values, X, Y).tolist()
 
     def predict_single(self, feature_name, x):
         if feature_name not in self.feature_dict:
@@ -689,54 +599,26 @@ class GAMmodel:
             x_classes = feature["x"]
             y_values = feature["y"]
             y = []
-            for x in x:
-                if str(x) in x_classes:
-                    y.append(y_values[x_classes.index(str(x))])
+            for val in x:
+                if str(val) in x_classes:
+                    y.append(y_values[x_classes.index(str(val))])
                 else:
                     y.append(0)
-
         else:
-            x_values = feature["x"]
-            y_values = feature["y"]
-            y = np.interp(
-                x, x_values, y_values
-            )  # Linear interpolation # also strategies for interpolation beyond x limtis can be created here.
+            y = np.interp(x, feature["x"], feature["y"])
         return np.asarray(y, dtype=float)
 
-    def predict_raw(
-        self,
-        X,
-        include_intercept=True,
-    ):
+    def predict_raw(self, X, include_intercept=True):
         """
         Predict raw values using scaled numerical features and original (raw) categorical features.
         """
-        y = {}
+        y = np.zeros(len(X))
         for col in X.columns:
-            y[col] = self.predict_single(col, X[col])
-
-        y = pd.DataFrame(y)
-        # print(y)
-
-        y = np.array(y.sum(axis=1))
-        # if self.base_model.task == "regression" and self.base_model.scale_target:
-        #     y = y + self.base_model.y_scaler.mean_
-
-        # y_scaled = self.base_model.scale_y(y, fit_transform=False)
-
-        # print(y_scaled)
-        # print(self.base_model.linear_model.intercept_)
+            y += self.predict_single(col, X[col])
         if include_intercept:
             y = y + self.intercept_
-
         return y
 
     def get_feature_wise_pred(self, X):
-        """
-        This function returns the prediction of the GAM model for each feature.
-        """
-        y = {}
-        for col in X.columns:
-            y[col] = self.predict_single(col, X[col])
-
-        return y
+        """Returns the per-feature contribution of the GAM model."""
+        return {col: self.predict_single(col, X[col]) for col in X.columns}

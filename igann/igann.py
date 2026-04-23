@@ -596,14 +596,15 @@ class IGANN:
         # For Classification we work with the logits and not the probabilities. That's why we multiply X with
         # the coefficients and don't use the predict_proba function.
         if self.task == "classification":
+            intercept = float(np.asarray(self.linear_model.intercept_).reshape(-1)[0])
             y_hat_train = torch.squeeze(
                 torch.from_numpy(self.linear_model.coef_.astype(np.float32))
                 @ torch.transpose(X_train, 0, 1)
-            ) + float(self.linear_model.intercept_)
+            ) + intercept
             y_hat_val = torch.squeeze(
                 torch.from_numpy(self.linear_model.coef_.astype(np.float32))
                 @ torch.transpose(X_val, 0, 1)
-            ) + float(self.linear_model.intercept_)
+            ) + intercept
 
         else:
             y_hat_train = torch.from_numpy(
