@@ -30,11 +30,19 @@ class IGANN_interactive(IGANN):
         *args,
         GAM_detail=100,
         regressor_limit=100,
+        gam_feature_ranges=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.GAM_detail = GAM_detail
         self.regressor_limit = regressor_limit
+        # Optional {feature_name: (lower, upper)} raw-space bounds. When set, the
+        # GAM compression evaluates those numeric shape functions out to the
+        # given range instead of only the observed data range, so the stored
+        # shape follows the ELM ensemble's own extrapolation there. ``None`` for
+        # either bound keeps that end at the observed range. Default None leaves
+        # compression behavior unchanged.
+        self.gam_feature_ranges = gam_feature_ranges
         self._compress_after_optimization = True
         self._refit_feature_cols = None
         self._saved_train_indices = None
@@ -404,14 +412,62 @@ class IGANN_interactive(IGANN):
             reset_features=reset_features,
         )
 
-    def compress_to_GAM(self):
+    def _gam_eval_grid(self, feature_ranges):
+        """Per-feature evaluation grids for GAM compression.
+
+        Returns a list aligned with ``self.feature_names`` (or ``None`` to use
+        the default per-feature unique values). For each numeric feature named in
+        ``feature_ranges`` with raw-space ``(lower, upper)`` bounds, the observed
+        unique values are widened with evenly spaced points out to the requested
+        bound(s). The grid is evaluated while the ELM regressors still exist, so
+        the resulting shape follows the ensemble's own extrapolation beyond the
+        data range. ``None`` for a bound leaves that end at the observed range.
+        """
+        if not feature_ranges:
+            return None
+        numeric = getattr(self, "numerical_cols", [])
+        scaler = self.column_transformer.named_transformers_.get("num")
+        if scaler is None:
+            return None
+        grid = list(self.unique)
+        for fname, bounds in feature_ranges.items():
+            fname = str(fname)
+            if fname not in self.feature_names or fname not in numeric:
+                continue
+            i = self.feature_names.index(fname)
+            j = numeric.index(fname)
+            mu, sigma = float(scaler.mean_[j]), float(scaler.scale_[j])
+            cur = self.unique[i]
+            lower, upper = bounds
+            pieces = [cur]
+            if lower is not None:
+                scaled_lower = (float(lower) - mu) / sigma
+                if scaled_lower < float(cur.min()):
+                    pieces.insert(0, torch.linspace(
+                        scaled_lower, float(cur.min()), self.GAM_detail, dtype=cur.dtype))
+            if upper is not None:
+                scaled_upper = (float(upper) - mu) / sigma
+                if scaled_upper > float(cur.max()):
+                    pieces.append(torch.linspace(
+                        float(cur.max()), scaled_upper, self.GAM_detail, dtype=cur.dtype))
+            if len(pieces) > 1:
+                grid[i] = torch.unique(torch.cat(pieces))
+        return grid
+
+    def compress_to_GAM(self, feature_ranges=None):
         """
         Compress the model to a GAM model. This is useful if the model is too large and the user wants to make fast predictions.
+
+        ``feature_ranges`` (or, if omitted, ``self.gam_feature_ranges``) optionally
+        widens the evaluation range of selected numeric shape functions; see
+        :meth:`_gam_eval_grid`. Leave both unset for the default behavior.
         """
         if self.GAM is None:
             self.GAM = GAMmodel(task=self.task, detail=self.GAM_detail)
+        ranges = feature_ranges if feature_ranges is not None else getattr(self, "gam_feature_ranges", None)
+        x_values = self._gam_eval_grid(ranges)
         self.GAM.set_shape_data(
-            self._normalize_feature_dict_for_gam(self.get_shape_functions_as_dict()),
+            self._normalize_feature_dict_for_gam(self.get_shape_functions_as_dict(x_values)),
             intercept=self._get_linear_intercept(),
         )
 

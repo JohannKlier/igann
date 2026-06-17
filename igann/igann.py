@@ -291,7 +291,9 @@ class IGANN:
                 "string",
             ]  # String might beneficial for some cases
         ).columns.tolist()
-        self.numerical_cols = list(set(X.columns) - set(self.categorical_cols))
+        # sorted() so the column order is deterministic across runs: bare
+        # set() iteration order depends on per-process string hash seeding.
+        self.numerical_cols = sorted(list(set(X.columns) - set(self.categorical_cols)))
 
         # Build a list of (name, transformer, columns)
         transformers = []
